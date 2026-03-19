@@ -41,40 +41,47 @@ void CPUHalfBook::add(int64_t price, int64_t quantity) {
     cache_on_add(price, quantity);
 }
 
-void CPUHalfBook::cancel(int64_t price, int64_t quantity) {
-    int addr = addr_at(price);
+int64_t CPUHalfBook::cancel(int64_t price, int64_t quantity) {
+    int a = addr_at(price);
+    if (book_[a] == 0) return 0;           // non-existent level — ignore cleanly
+ 
+    int64_t actual = std::min(quantity, book_[a]);
     int index = find_in_cache(price);
-    if (index != -1) {
-        cache_[index].quantity -= quantity;
-    }
-
-    book_[addr] -= quantity;
-    if (book_[addr] <= 0) {
-        book_[addr] = 0;
-        ll_remove(addr);
+    if (index != -1) cache_[index].quantity -= actual;
+    book_[a] -= actual;
+    if (book_[a] <= 0) {
+        book_[a] = 0;
+        ll_remove(a);
         cache_evict(price);
     }
+    return actual;
 }
 
-void CPUHalfBook::trade(int64_t quantity) {
-    if (cache_sz_ == 0) return;
-
-    int64_t top_price = cache_[0].price;
-    int cacheAddr = addr_at(cache_[0].price);
-
-    book_[cacheAddr] -= quantity;
-    cache_[0].quantity -= quantity;
-
-    if (book_[cacheAddr] <= 0) {
-        book_[cacheAddr] = 0;
-        ll_remove(cacheAddr);
-        cache_evict(top_price);
+int64_t CPUHalfBook::match(int64_t quantity) {
+    int64_t remaining = quantity;
+    while (remaining > 0 && cache_sz_ > 0) {
+        int64_t top_price    = cache_[0].price;
+        int64_t available    = cache_[0].quantity;
+        int64_t consumed     = std::min(remaining, available);
+        int     a            = addr_at(top_price);
+        cache_[0].quantity -= consumed;
+        book_[a]           -= consumed;
+        remaining          -= consumed;
+ 
+        if (book_[a] <= 0) {
+            book_[a] = 0;
+            ll_remove(a);
+            cache_evict(top_price);
+        }
     }
+    return quantity - remaining;   // how much was actually fille
 }
 
 int64_t CPUHalfBook::best_price() const {
     return cache_[0].price;
 }
+
+int64_t CPUHalfBook::best_qty() const { return cache_sz_ > 0 ? cache_[0].quantity  : 0; }
 
 std::array<Feed, TOP_N> CPUHalfBook::publish() {
     std::array<Feed, TOP_N> result;
@@ -98,7 +105,8 @@ std::vector<Feed> CPUHalfBook::cache_snapshot() const {
 }
 
 int CPUHalfBook::cache_size() const { return cache_sz_; }
-        
+
+bool CPUHalfBook::empty() const { return cache_sz_ == 0; }
 
 bool CPUHalfBook::is_better(int64_t a, int64_t b) const {
     switch(side_) {

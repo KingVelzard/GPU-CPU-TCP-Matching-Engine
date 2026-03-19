@@ -14,20 +14,14 @@ void CPUOrderBook::add(int64_t price, int64_t quantity, bool is_bid) {
     }
 }
 
-void CPUOrderBook::cancel(int64_t price, int64_t quantity, bool is_bid) {
-    if (is_bid) {
-        this->bid_.cancel(price, quantity);
-    } else {
-        this->ask_.cancel(price, quantity);
-    }
+int64_t CPUOrderBook::cancel(int64_t price, int64_t quantity, bool is_bid) {
+    return is_bid ? bid_.cancel(price, quantity) 
+                  : ask_.cancel(price, quantity);
 }
 
-void CPUOrderBook::trade(int64_t quantity, bool is_bid_aggressor) {
-    if (is_bid_aggressor) {
-        this->ask_.trade(quantity);
-    } else {
-        this->bid_.trade(quantity);
-    }
+int64_t CPUOrderBook::trade(int64_t quantity, bool is_bid_aggressor) {
+    return is_bid_aggressor ? ask_.match(quantity) 
+                            : bid_.match(quantity);   
 }
 
 MarketData CPUOrderBook::publish() {
@@ -36,6 +30,12 @@ MarketData CPUOrderBook::publish() {
 
 int64_t CPUOrderBook::best_bid() const { return bid_.best_price(); }
 int64_t CPUOrderBook::best_ask() const { return ask_.best_price(); }
+int64_t CPUOrderBook::best_bid_qty()  const { return bid_.best_qty(); }
+int64_t CPUOrderBook::best_ask_qty()  const { return ask_.best_qty(); }
+bool    CPUOrderBook::ask_empty()     const { return ask_.empty(); }
+bool    CPUOrderBook::bid_empty()     const { return bid_.empty(); }
+int64_t CPUOrderBook::ask_at(int64_t p) const { return ask_.book_at(p); }
+int64_t CPUOrderBook::bid_at(int64_t p) const { return bid_.book_at(p); }
 
 
 

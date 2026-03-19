@@ -31,18 +31,18 @@ class CPUHalfBook {
 
         void add(int64_t price, int64_t quantity);
 
-        void cancel(int64_t price, int64_t quantity);
-        void trade(int64_t quantity);
-        int64_t best_price() const;
-
+        int64_t cancel(int64_t price, int64_t quantity);
+        int64_t match(int64_t quantity);
         std::array<Feed, TOP_N> publish();
+
+        int64_t best_price() const;
+        int64_t best_qty() const;
         int64_t book_at(int64_t price) const;
 
         std::vector<int> forward_walk() const;
-
         std::vector<Feed> cache_snapshot() const;
-
         int cache_size() const;        
+        bool empty() const;
 
     private:
 
