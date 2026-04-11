@@ -61,7 +61,7 @@ struct alignas(64) MatchCommandRing {
     slots[t & MATCH_RING_MASK] = cmd;
 
     // release: slot write needs to be visible before tail increment and command add 
-    tail.store(tail + 1, std::memory_order_release);
+    this->tail.store(tail + 1, std::memory_order_release);
     return true;
   }
 
