@@ -78,6 +78,27 @@ void Reactor::run()
 __attribute__((optimize("O3")))
 void Reactor::handle_client_data(Connection* conn)
 {
+
+  // -------------------------------------------------------------------------
+    // TODO (VALIDATION): This implementation has three known issues to fix:
+    //
+    // 1. PARTIAL READS: recv() may return fewer than sizeof(OrderMessage) bytes.
+    //    Need to accumulate bytes in Connection::recv_buf until a full message
+    //    arrives before processing. Currently a partial read produces a corrupt
+    //    OrderMessage that gets passed to the GPU.
+    //
+    // 2. MULTIPLE MESSAGES: recv() may return more than sizeof(OrderMessage)
+    //    bytes if the client sent multiple orders in one TCP segment. Currently
+    //    only the first message is processed and the rest are silently discarded.
+    //
+    // 3. NO VALIDATION: The bytes are blindly cast to OrderMessage* with no
+    //    checks on side, type, instrument index, price bounds, or qty.
+    //    A malformed or malicious message can cause an out-of-bounds write
+    //    in GPU global memory via an unchecked instrument index or price_idx.
+    //    Add a validate(OrderMessage*) call before pushing to the queue.
+    //    See validate() stub in Classifier.h.
+    // -------------------------------------------------------------------------
+
     char buf[RECV_BUF_SIZE];	// buffer for client data
     int sender_fd = conn->fd;
 
@@ -147,6 +168,11 @@ void Reactor::handle_new_connection()
     int newfd; // newly accepted sockfd
     char remoteIP[INET6_ADDRSTRLEN];
 
+    struct epoll_event event_settings;
+    // set both so we don't have to modify 
+    event_settings.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+    event_settings.data.ptr = conn;
+
     while (true) {
         newfd = accept4(this->listener, (struct sockaddr*)&remoteaddr,
                 &addrlen, SOCK_NONBLOCK | SOCK_CLOEXEC);
@@ -165,7 +191,6 @@ void Reactor::handle_new_connection()
         int enable = 1;
         int cpu = sched_getcpu();
         int micro_seconds = 50; // Poll for 50us before sleeping
-        setsockopt(newfd, SOL_SOCKET, SO_INCOMING_CPU, &cpu, sizeof(cpu)); // route connections
         setsockopt(newfd, IPPROTO_TCP, TCP_NODELAY, &enable, sizeof(enable)); // no delay
         setsockopt(newfd, SOL_SOCKET, SO_BUSY_POLL, &micro_seconds, sizeof(int)); // make sure to keep
         setsockopt(newfd, IPPROTO_TCP, TCP_QUICKACK, &enable, sizeof(enable)); // quick ack
@@ -173,9 +198,7 @@ void Reactor::handle_new_connection()
         Connection* conn = &(*connection_pool)[newfd];
         conn->reset(newfd);
 
-        struct epoll_event event_settings;
-        event_settings.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
-        event_settings.data.ptr = conn;
+        
 
         if (__builtin_expect(epoll_ctl(epoll, EPOLL_CTL_ADD, newfd, &event_settings) == -1, 0)) {
             perror("epoll_ct1: newfd");
@@ -246,10 +269,18 @@ int Reactor::get_listener()
             exit(1);
         }
         
+
+        // POSSIBLY DELETE SINCE CUDA OVERHEAD ABOVE, WASTING CPU RESOURCE 
         int micro_seconds = 50;
         if (setsockopt(listen_sockfd, SOL_SOCKET, SO_BUSY_POLL, &micro_seconds,
                     sizeof(int)) == -1) {
             perror("setsockopt: SO_BUSY_POLL");
+            exit(1);
+        }
+        
+        int cpu = sched_getcpu();
+        if (setsockopt(listen_sockfd, SOL_SOCKET, SO_INCOMING_CPU, &cpu, sizeof(cpu)) == -1) {
+            perror("setsockopt: SO_INCOMING_CPU");
             exit(1);
         }
 

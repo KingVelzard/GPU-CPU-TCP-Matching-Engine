@@ -1,11 +1,11 @@
 #pragma once
 #include <cstdint>
 
-// ClientResult: sent back to client after a match 
+// MatchResult: sent back to client after a match 
 // Written by CPU matcher after match executes
 // Routed Back to original TCP connection via connection token
 
-struct alignas(32) ClientResult {
+struct alignas(32) MatchResult {
   uint32_t order_id; // just like OrderMessage echoes
   uint32_t instrument; // which instrument 
   int64_t filled_qty; // how many shares were filled 
@@ -17,5 +17,6 @@ struct alignas(32) ClientResult {
 };
 
 
-static_assert(sizeof(ClientResult) == 32, "client result should be 32 bytes");
+static_assert(sizeof(MatchResult) == 32, "match result should be 32 bytes");
+static_assert(alignof(MatchResult) == 32, "match result alignment should be 32 bytes");
 

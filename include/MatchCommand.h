@@ -19,13 +19,16 @@ struct alignas(16) MatchCommand {
   uint32_t instrument; // which instrument (= GPU block)
   uint32_t price_idx; // addr_at(price) or (price - limit_down) / tick 
   uint8_t side; // 0 = bid, 1 = ask 
-  uint8_t _pad[7] // pad to reach 32 bytes
+  uint8_t _pad[7]; // pad to reach 32 bytes
 
 };
 
 static_assert(sizeof(MatchCommand) == 32, "MatchCommand is 32 bytes");
+static_assert(alignof(MatchCommand) == 16, "MatchCommand is 32 bytes");
 
 // MatchCommandRing: SPSC ring buffer in cudaMallocHost (pinned memory)
+//
+// DO NOT USE OUR SPSC QUEUE AS NEEDS TO BE CUDAMALLOCED
 //
 // Producer: CPU matcher thread 
 // Consumer: GPU kernel (one thread per block reads at kernel start)
@@ -69,6 +72,7 @@ struct alignas(64) MatchCommandRing {
   // NOTE THIS FUNCTION IS __device__ ONLY DO NOT CALL FROM CPU
   // Implemented in LOBKernel.cu 
 
-  DEVICE_ATTR int pop();
+};
 
-}
+static_assert(alignof(MatchCommandRing) == 64, "MatchCommandRing alignment should be 64");
+static_assert(sizeof(std::array<MatchCommand, 256>) == 256 * sizeof(MatchCommand));

@@ -46,7 +46,13 @@ struct alignas(64) Connection {
     public:
         int fd;
         size_t write_offset;
-        
+       
+        // TODO (VALIDATION): add partial message framing here.
+        // TCP is a stream — recv() may return fewer than sizeof(OrderMessage) bytes.
+        // Need: uint8_t recv_buf[sizeof(OrderMessage)] and uint32_t recv_bytes
+        // to accumulate a complete message before processing.
+        // See handle_client_data in Reactor.cpp for where this is consumed.
+
         Connection();
         Connection(int f, size_t wo);
 
