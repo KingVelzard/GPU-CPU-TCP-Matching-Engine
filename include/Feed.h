@@ -1,16 +1,13 @@
 #pragma once
-#include <cstdint>
+#include "../tools/utils.h"
 #include <array>
+#include <cstdint>
 
-// TOP_N: the number of best price levels maintained in cache as of now
-
-static constexpr int TOP_N = 50;
-
-// Feed: entry in the TOP_N cache 
+// Feed: entry in the TOP_N cache
 // represents a price level
 struct alignas(16) Feed {
-  int64_t price; // fixed point price
-  int64_t quantity; // total quantity on price level 
+  int64_t price;    // fixed point price
+  int64_t quantity; // total quantity on price level
 };
 
 static_assert(sizeof(Feed) == 16, "Feed must be 16 bytes");
@@ -20,9 +17,9 @@ static_assert(alignof(Feed) == 16, "Feed alignment must be 16 bytes");
 // because 32 threads in warp, pad 16 bytes so no banking conflicts
 
 struct alignas(32) FeedSM {
-  int64_t price; // fixed point price
-  int64_t quantity; // total quantity on price level 
-  int64_t : 128; // pads to 32 bytes
+  int64_t price;    // fixed point price
+  int64_t quantity; // total quantity on price level
+  int64_t : 128;    // pads to 32 bytes
 };
 
 static_assert(sizeof(FeedSM) == 32, "FeedSM must be 32 bytes");
@@ -37,4 +34,4 @@ struct MarketData {
 };
 
 static_assert(sizeof(MarketData) == 2 * TOP_N * sizeof(Feed),
-    "MarketData size unexpected — check Feed alignment and TOP_N");
+              "MarketData size unexpected — check Feed alignment and TOP_N");

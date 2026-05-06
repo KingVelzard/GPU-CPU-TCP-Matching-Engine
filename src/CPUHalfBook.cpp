@@ -238,7 +238,7 @@ void CPUHalfBook::ll_remove(int index) {
     poison(index);    
 }
 
-        // for easy addr/price translation
+// for easy addr/price translation
 int CPUHalfBook::addr_at(int64_t price) const {
     return ((price - this->limit_down) / this->tick) + 1;
 }

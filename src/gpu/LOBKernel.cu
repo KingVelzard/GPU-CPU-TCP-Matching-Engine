@@ -1,348 +1,256 @@
-#include "GPUBook.cuh"
-#include "../../include/InstrumentSnapshot.h"
-#include "../../include/MatchCommand.h"
-#include "../../include/BookDelta.h"
 #include "../../include/Feed.h"
-#include <cuda_runtime.h>
+#include "../../include/InstrumentSnapshot.h"
+#include "GPUBook.cuh"      // GPU_INSTRUMENT_STRIDE_ELEMS, GPU_BID_OFFSET, GPU_ASK_OFFSET
+#include "LOBKernelTypes.h" // LOBKernelParams, launch_lob_kernel declaration
+#include <atomic>
 #include <cooperative_groups.h>
+#include <cuda_runtime.h>
 
 namespace cg = cooperative_groups;
 
-// =============================================================================
-// Kernel parameters struct — passed as a single pointer to the kernel.
-// Grouping parameters avoids the 4KB CUDA kernel parameter limit and makes
-// the launch configuration explicit.
-// =============================================================================
-
-struct LOBKernelParams {
-    // GPU book arrays
-    int64_t*             device_book;           // GPUBook::device_ptr
-
-    // Batch input (SoA, cudaMallocHost)
-    const uint32_t*      batch_instrument_id;
-    const uint32_t*      batch_price_idx;
-    const int64_t*       batch_quantity;
-    const uint8_t*       batch_side;
-    const uint32_t*      batch_instrument_count; // [N_INSTRUMENTS] orders per instrument
-
-    // Match commands (CPU→GPU, cudaMallocHost SPSC ring)
-    MatchCommandRing*    match_ring;
-
-    // Delta output (GPU→CPU, cudaMallocHost)
-    DeltaOutputBuffer*   delta_out;
-
-    // Pinned output buffer (seqlock-protected snapshots)
-    InstrumentSnapshot*  snapshots;
-
-    // Batch sequence number for batch_seq field in snapshot
-    uint32_t             batch_seq;
-};
-
-// =============================================================================
-// Shared memory layout for one block (one instrument).
-// Must fit within sharedMemPerBlock (typically 48KB-96KB).
-// =============================================================================
-
+// Shared memory layout for one block (one instrument per block).
 struct alignas(64) BlockSharedMem {
-    FeedSM  bid_cache[TOP_N]; // current top-N bid levels (loaded from snapshot)
-    FeedSM  ask_cache[TOP_N]; // current top-N ask levels
-    int     bid_cache_sz;     // number of valid bid cache entries
-    int     ask_cache_sz;     // number of valid ask cache entries
+  FeedSM bid_cache[TOP_N]; // top-N bid levels after recompute
+  FeedSM ask_cache[TOP_N]; // top-N ask levels after recompute
+  int bid_cache_sz;
+  int ask_cache_sz;
 
-    // Working space for cache recompute (Option B: parallel reduction)
-    // Sized for one warp's worth of candidates
-    int64_t reduce_scratch[64]; // scratch for finding best bid/ask in block
-
-    uint32_t delta_write_idx; // atomic counter for writing deltas (used by thread 0)
-
-    // Match commands applied this batch (for debugging/stats)
-    uint32_t match_cmds_applied;
+  int32_t reduce_scratch[32];  // warp-lane 0 reduction intermediates
+  uint32_t match_cmds_applied; // diagnostic; used by Phase 1
 };
 
-// =============================================================================
-// Device helper: get pointer to bid/ask array for this block's instrument
-// =============================================================================
-
-__device__ inline int64_t* bid_base(int64_t* book, uint32_t instrument) {
-    return book + instrument * GPU_INSTRUMENT_STRIDE_ELEMS + GPU_BID_OFFSET;
+__device__ inline int64_t *bid_base(int64_t *book, uint32_t instrument) {
+  return book + instrument * GPU_INSTRUMENT_STRIDE_ELEMS + GPU_BID_OFFSET;
 }
 
-__device__ inline int64_t* ask_base(int64_t* book, uint32_t instrument) {
-    return book + instrument * GPU_INSTRUMENT_STRIDE_ELEMS + GPU_ASK_OFFSET;
+__device__ inline int64_t *ask_base(int64_t *book, uint32_t instrument) {
+  return book + instrument * GPU_INSTRUMENT_STRIDE_ELEMS + GPU_ASK_OFFSET;
 }
 
-// =============================================================================
-// Phase 1: Apply pending MatchCommands from the CPU matcher.
-// Run by thread 0 only (SPSC — one reader).
-// Must complete before Phase 3 (batch processing).
-// =============================================================================
+// Per-instrument price at a flat array index.
+__device__ inline int64_t price_at(const LOBKernelParams &params, uint32_t instrument, int32_t index) {
+  return params.limit_down[instrument] + static_cast<int64_t>(index) * params.tick_sz[instrument];
+}
 
-__device__ void phase1_apply_match_commands(
-    LOBKernelParams& p,
-    uint32_t instrument,
-    BlockSharedMem& smem)
-{
-    if (threadIdx.x != 0) return;
+// ── Phase 1: apply pending MatchCommands from CPU Matcher ─────────────────────
+// Thread 0 only — single GPU consumer of the SPSC ring.
 
-    // Read the ring tail with volatile to bypass L1 cache and see the CPU's
-    // most recent store. Without volatile, the GPU may read a stale tail
-    // from its own L1 and miss pending commands.
-    uint32_t tail = *((volatile uint32_t*)&p.match_ring->tail);
-    uint32_t head = p.match_ring->head;
-    uint32_t applied = 0;
+__device__ void apply_match_commands(LOBKernelParams &params, uint32_t instrument, BlockSharedMem &smem) {
+  if (threadIdx.x != 0)
+    return;
 
-    while (head != tail) {
-        const MatchCommand& cmd = p.match_ring->slots[head & MATCH_RING_MASK];
+  // acquire load on tail: see all CPU writes that preceded the tail store.
+  const uint32_t tail = params.match_ring->tail.load(std::memory_order_acquire);
+  uint32_t head = params.match_ring->head.load(std::memory_order_relaxed);
+  uint32_t applied = 0;
 
-        // Only apply commands for this block's instrument
-        if (cmd.instrument == instrument) {
-            int64_t* book_side = (cmd.side == 0)
-                ? bid_base(p.device_book, instrument)
-                : ask_base(p.device_book, instrument);
+  while (head != tail) {
+    const MatchCommand &cmd = params.match_ring->slots[head & MATCH_RING_MASK];
 
-            // TODO (HW4 Part 4, Task 2): apply atomicAdd with cmd.quantity (negative)
-            // atomicAdd((unsigned long long*)&book_side[cmd.price_idx],
-            //           (unsigned long long)cmd.quantity);
-            (void)book_side; // suppress unused warning until TODO is done
-        }
-
-        head++;
-        applied++;
+    if (cmd.instrument == instrument) {
+      int64_t *book_side =
+          (cmd.side == 0) ? bid_base(params.device_book, instrument) : ask_base(params.device_book, instrument);
+      atomicAdd(reinterpret_cast<unsigned long long *>(&book_side[cmd.price_idx]),
+                static_cast<unsigned long long>(cmd.quantity));
     }
 
-    // Advance the head to mark commands as consumed
-    p.match_ring->head = head;
-    smem.match_cmds_applied = applied;
+    ++head;
+    ++applied;
+  }
+
+  // release: CPU producer sees updated head before writing new commands.
+  params.match_ring->head.store(head, std::memory_order_release);
+  smem.match_cmds_applied = applied;
 }
 
-// =============================================================================
-// Phase 2: Load top-N cache from pinned snapshot into shared memory.
-// All threads in the block participate (one thread per cache slot).
-// =============================================================================
+// ── Phase 2: load top-N cache from pinned snapshot into shared memory ─────────
 
-__device__ void phase2_load_cache(
-    LOBKernelParams& p,
-    uint32_t instrument,
-    BlockSharedMem& smem)
-{
-    const InstrumentSnapshot& snap = p.snapshots[instrument];
+__device__ void load_cache(LOBKernelParams &params, uint32_t instrument, BlockSharedMem &smem) {
+  const InstrumentSnapshot &snap = params.snapshots[instrument];
+  const int tid = static_cast<int>(threadIdx.x);
 
-    // Threads 0..TOP_N-1 load one bid slot each
-    if (threadIdx.x < TOP_N) {
-        smem.bid_cache[threadIdx.x] = snap.best_bids[threadIdx.x];
-    }
+  if (tid < TOP_N)
+    smem.bid_cache[tid] = snap.best_bids[tid];
+  else if (tid < 2 * TOP_N)
+    smem.ask_cache[tid - TOP_N] = snap.best_asks[tid - TOP_N];
 
-    // Threads TOP_N..2*TOP_N-1 load one ask slot each
-    if (threadIdx.x >= TOP_N && threadIdx.x < 2 * TOP_N) {
-        smem.ask_cache[threadIdx.x - TOP_N] = snap.best_asks[threadIdx.x - TOP_N];
-    }
-
-    // Thread 0 reads cache sizes
-    // TODO (HW4 Part 2, Task 1): store and retrieve actual cache sizes
-    // For now, assume full cache
-    if (threadIdx.x == 0) {
-        smem.bid_cache_sz = TOP_N;
-        smem.ask_cache_sz = TOP_N;
-        smem.delta_write_idx = 0;
-    }
-
-    __syncthreads();
+  if (tid == 0) {
+    smem.bid_cache_sz = TOP_N;
+    smem.ask_cache_sz = TOP_N;
+  }
+  __syncthreads();
 }
 
-// =============================================================================
-// Phase 3: Process add/cancel batch.
-// Each thread handles one order from this instrument's batch.
-// =============================================================================
+// ── Phase 3: apply add/cancel batch orders to the GPU book ────────────────────
 
-__device__ void phase3_process_batch(
-    LOBKernelParams& p,
-    uint32_t instrument,
-    BlockSharedMem& smem)
-{
-    uint32_t order_count = p.batch_instrument_count[instrument];
+__device__ void process_batch(LOBKernelParams &params, uint32_t instrument, BlockSharedMem &smem) {
+  const uint32_t order_count = params.batch_count[instrument];
+  const int tid = static_cast<int>(threadIdx.x);
 
-    // Thread index within this instrument's orders
-    // (orders are stored contiguously per instrument in the batch after assembly)
-    // TODO (HW4 Part 5): compute correct offset into batch arrays for this instrument
-    uint32_t order_idx = threadIdx.x;
+  if (static_cast<uint32_t>(tid) < order_count) {
+    // Sub-batch for instrument i occupies global slots
+    // [i * BATCH_PER_INSTRUMENT, i * BATCH_PER_INSTRUMENT + count[i]).
+    const uint32_t global_idx = instrument * BATCH_PER_INSTRUMENT + static_cast<uint32_t>(tid);
+    const uint32_t price_idx = params.batch_price_idx[global_idx];
+    const int64_t quantity = params.batch_quantity[global_idx];
+    const uint8_t side = params.batch_side[global_idx];
 
-    if (order_idx < order_count) {
-        // TODO (HW4 Part 1, Task 3): look up the global batch index for this
-        // instrument's order_idx-th order. For now, use order_idx directly
-        // (assumes orders are pre-sorted by instrument, one block per instrument).
-        uint32_t global_idx = order_idx; // placeholder
+    int64_t *book_side =
+        (side == 0) ? bid_base(params.device_book, instrument) : ask_base(params.device_book, instrument);
 
-        uint32_t price_idx = p.batch_price_idx[global_idx];
-        int64_t  qty       = p.batch_quantity[global_idx];
-        uint8_t  side      = p.batch_side[global_idx];
+    atomicAdd(reinterpret_cast<unsigned long long *>(&book_side[price_idx]), static_cast<unsigned long long>(quantity));
+  }
+  (void)smem;
+}
 
-        // Select the correct side of the book
-        int64_t* book_side = (side == 0)
-            ? bid_base(p.device_book, instrument)
-            : ask_base(p.device_book, instrument);
+// ── Phase 4: recompute top-N cache from updated book ─────────────────────────
 
-        // TODO (HW4 Part 1, Task 3): implement warp-aggregated atomics
-        // for spread-level contention (orders clustering near top 3-5 levels).
-        // For now, use a plain atomicAdd.
-        atomicAdd((unsigned long long*)&book_side[price_idx],
-                  (unsigned long long)qty);
+__device__ void recompute_cache(LOBKernelParams &params, uint32_t instrument, BlockSharedMem &smem) {
+  int64_t *bids = bid_base(params.device_book, instrument);
+  int64_t *asks = ask_base(params.device_book, instrument);
+
+  // Each thread scans its slice of GPU_MAX_LEVELS for local best bid/ask.
+  const uint32_t levels_per_thread = (GPU_MAX_LEVELS + blockDim.x - 1) / blockDim.x;
+  const uint32_t start = threadIdx.x * levels_per_thread;
+  const uint32_t end = min(start + levels_per_thread, GPU_MAX_LEVELS);
+
+  // Sentinel -1 for bid (any valid index > -1), INT32_MAX for ask (any valid index < INT32_MAX).
+  int32_t local_best_bid = -1;
+  int32_t local_best_ask = INT32_MAX;
+
+  for (uint32_t i = start; i < end; ++i)
+    if (bids[i] > 0)
+      local_best_bid = static_cast<int32_t>(i);
+
+  for (uint32_t i = start; i < end; ++i) {
+    if (asks[i] > 0) {
+      local_best_ask = static_cast<int32_t>(i);
+      break;
     }
+  }
 
-    __syncthreads(); // all atomicAdds must complete before cache recompute
+  auto block = cg::this_thread_block();
+  auto warp = cg::tiled_partition<32>(block);
+
+  // greater: picks the highest bid index across the warp (correct with -1 sentinel).
+  // less:    picks the lowest  ask index across the warp (correct with INT32_MAX sentinel).
+  const int32_t warp_best_bid = cg::reduce(warp, local_best_bid, cg::greater<int32_t>());
+  const int32_t warp_best_ask = cg::reduce(warp, local_best_ask, cg::less<int32_t>());
+
+  if (warp.thread_rank() == 0) {
+    const int w = warp.meta_group_rank();
+    smem.reduce_scratch[w * 2] = warp_best_bid;
+    smem.reduce_scratch[w * 2 + 1] = warp_best_ask;
+  }
+  block.sync();
+
+  if (threadIdx.x == 0) {
+    const uint32_t n_warps = blockDim.x / 32;
+    int32_t best_bid = -1;
+    int32_t best_ask = INT32_MAX;
+
+    for (uint32_t w = 0; w < n_warps; ++w) {
+      const int32_t wb = smem.reduce_scratch[w * 2];
+      const int32_t wa = smem.reduce_scratch[w * 2 + 1];
+      if (wb > best_bid)
+        best_bid = wb;
+      if (wa < best_ask)
+        best_ask = wa;
+    }
+    if (best_ask == INT32_MAX)
+      best_ask = -1; // no asks found — make sentinel consistent
+
+    // Walk TOP_N bids (highest price first, descending from best_bid).
+    int slot_b = 0;
+    for (int i = best_bid; i >= 0 && slot_b < TOP_N; --i)
+      if (bids[i] > 0)
+        smem.bid_cache[slot_b++] = {price_at(params, instrument, i), bids[i]};
+    smem.bid_cache_sz = slot_b;
+
+    // Walk TOP_N asks (lowest price first, ascending from best_ask).
+    int slot_a = 0;
+    if (best_ask >= 0) {
+      for (int i = best_ask; i < static_cast<int>(GPU_MAX_LEVELS) && slot_a < TOP_N; ++i)
+        if (asks[i] > 0)
+          smem.ask_cache[slot_a++] = {price_at(params, instrument, i), asks[i]};
+    }
+    smem.ask_cache_sz = slot_a;
+  }
+
+  block.sync();
 }
 
-// =============================================================================
-// Phase 4: Recompute top-N cache from updated book_[].
-// Option B (full parallel recompute) — correct by construction.
-// TODO (HW4 Part 2): implement. Stub leaves smem cache unchanged.
-// =============================================================================
+// ── Phase 5: seqlock writeback to pinned snapshot ─────────────────────────────
+// All threads participate: thread 0 owns the seqlock; others write cache slots.
 
-__device__ void phase4_recompute_cache(
-    LOBKernelParams& p,
-    uint32_t instrument,
-    BlockSharedMem& smem)
-{
-    // TODO (HW4 Part 2, Task 2): implement Option B (parallel scan over book_[])
-    // or Option C (sort over active set from batch).
-    //
-    // The goal: find the top TOP_N occupied levels for bids (highest prices)
-    // and asks (lowest prices) and write them into smem.bid_cache / smem.ask_cache.
-    //
-    // Starting point for Option B:
-    //   Each thread scans book_[threadIdx.x .. threadIdx.x + step .. MAX_LEVELS]
-    //   Use cub::BlockReduce to find the global maximum bid level.
-    //   Extend to find top-N by repeating N times (or use partial sort).
+__device__ void seqlock_writeback(LOBKernelParams &params, uint32_t instrument, BlockSharedMem &smem) {
+  InstrumentSnapshot &snap = params.snapshots[instrument];
+  const int tid = static_cast<int>(threadIdx.x);
 
-    (void)p; (void)instrument; (void)smem; // suppress unused warnings
-    __syncthreads();
-}
-
-// =============================================================================
-// Phase 5: Write-back to pinned snapshot buffer (seqlock write protocol).
-// Run by thread 0. Must be last — depends on Phase 4 completing.
-// =============================================================================
-
-__device__ void phase5_seqlock_writeback(
-    LOBKernelParams& p,
-    uint32_t instrument,
-    BlockSharedMem& smem)
-{
-    if (threadIdx.x != 0) return;
-
-    InstrumentSnapshot& snap = p.snapshots[instrument];
-
-    // Step 1: signal write in progress (version goes odd)
-    atomicAdd((unsigned int*)&snap.version, 1u);
-
-    // Step 2: make the odd version visible to CPU before any data write
+  if (tid == 0) {
+    atomicAdd(reinterpret_cast<unsigned int *>(&snap.version), 1u); // version → odd
     __threadfence_system();
+  }
+  __syncthreads();
 
-    // Step 3: write top-N cache arrays
-    // TODO (HW4 Part 6, Task 2): write all TOP_N bid and ask slots from smem
-    // For now, write only best_bid_price and best_ask_price as a minimal stub.
-    // Full implementation copies smem.bid_cache[] and smem.ask_cache[] into
-    // snap.best_bids[] and snap.best_asks[].
+  // All TOP_N slots are always written — slots beyond cache_sz get zeroed so
+  // stale entries from a previous batch never linger.
+  const FeedSM zero{0LL, 0LL};
+  if (tid < TOP_N)
+    snap.best_bids[tid] = (tid < smem.bid_cache_sz) ? smem.bid_cache[tid] : zero;
+  else if (tid < 2 * TOP_N) {
+    const int a = tid - TOP_N;
+    snap.best_asks[a] = (a < smem.ask_cache_sz) ? smem.ask_cache[a] : zero;
+  }
+  __syncthreads();
 
-    if (smem.bid_cache_sz > 0) {
-        atomicExch((long long*)&snap.best_bid_price, (long long)smem.bid_cache[0].price);
-    }
-    if (smem.ask_cache_sz > 0) {
-        atomicExch((long long*)&snap.best_ask_price, (long long)smem.ask_cache[0].price);
-    }
-    snap.batch_seq.store(p.batch_seq, std::memory_order_relaxed);
-
-    // Step 4: make all data writes visible before signaling done
+  if (tid == 0) {
+    if (smem.bid_cache_sz > 0)
+      atomicExch(reinterpret_cast<long long *>(&snap.best_bid_price), static_cast<long long>(smem.bid_cache[0].price));
+    if (smem.ask_cache_sz > 0)
+      atomicExch(reinterpret_cast<long long *>(&snap.best_ask_price), static_cast<long long>(smem.ask_cache[0].price));
+    snap.batch_seq.store(params.batch_seq, std::memory_order_relaxed);
     __threadfence_system();
-
-    // Step 5: signal write done (version goes even)
-    atomicAdd((unsigned int*)&snap.version, 1u);
+    atomicAdd(reinterpret_cast<unsigned int *>(&snap.version), 1u); // version → even
+  }
 }
 
-// =============================================================================
-// Phase 6: Write delta output buffer.
-// Records (price_idx, new_quantity) for every level modified in this batch.
-// CPU reads these in on_batch_complete() to call apply_delta().
-// Run by thread 0. TODO (HW4 Part 4, Task 3): implement.
-// =============================================================================
+// ── Phase 6: delta output (stubbed) ───────────────────────────────────────────
 
-__device__ void phase6_write_deltas(
-    LOBKernelParams& p,
-    uint32_t instrument,
-    BlockSharedMem& smem)
-{
-    if (threadIdx.x != 0) return;
-
-    // TODO (HW4 Part 4, Task 3):
-    // For each price_idx in the batch (plus MatchCommands applied),
-    // write one BookDelta entry: { instrument, price_idx, new_quantity, side }
-    // Use atomicAdd on p.delta_out->count to claim a slot.
-    //
-    // new_quantity = current value of book_[price_idx] after all atomics.
-    // Read it with a plain load — all atomics in Phase 3 have completed
-    // and no other kernel is running concurrently (ensured by the
-    // cross-stream event guard in the dispatch thread).
-
-    (void)p; (void)instrument; (void)smem; // suppress until TODO
+__device__ void write_deltas(LOBKernelParams &, uint32_t, BlockSharedMem &) {
+  // GPU→CPU sync now handled entirely through the Phase 5 seqlock snapshot.
 }
 
-// =============================================================================
-// The main LOB kernel.
-//
-// Launch configuration:
-//   gridDim.x  = N_INSTRUMENTS  (one block per instrument)
-//   blockDim.x = MAX_BATCH_SIZE (must be >= max orders per instrument per batch)
-//   shared mem = sizeof(BlockSharedMem)
-//
-// All six phases run sequentially within each block.
-// Blocks for different instruments run concurrently on different SMs.
-// =============================================================================
+// ── Main kernel ───────────────────────────────────────────────────────────────
+// Launch: gridDim.x = GPU_N_INSTRUMENTS, blockDim.x = MAX_BATCH_SIZE,
+//         smem = sizeof(BlockSharedMem)
 
-__global__ void lob_kernel(LOBKernelParams p) {
-    // This block is responsible for instrument blockIdx.x
-    uint32_t instrument = blockIdx.x;
+__global__ void lob_kernel(LOBKernelParams params) {
+  const uint32_t instrument = blockIdx.x;
+  __shared__ BlockSharedMem smem;
 
-    // Shared memory for this block (one block = one instrument)
-    __shared__ BlockSharedMem smem;
+  apply_match_commands(params, instrument, smem);
+  __syncthreads();
 
-    // Phase 1: Apply MatchCommands from CPU matcher (thread 0 only)
-    phase1_apply_match_commands(p, instrument, smem);
-    __syncthreads();
+  load_cache(params, instrument, smem);
+  __syncthreads();
 
-    // Phase 2: Load current cache from pinned snapshot
-    phase2_load_cache(p, instrument, smem);
-    // __syncthreads() is at the end of phase2
+  process_batch(params, instrument, smem);
+  __syncthreads();
 
-    // Phase 3: Process add/cancel batch (all threads)
-    phase3_process_batch(p, instrument, smem);
-    // __syncthreads() is at the end of phase3
+  recompute_cache(params, instrument, smem);
+  __syncthreads();
 
-    // Phase 4: Recompute top-N cache (all threads cooperate)
-    phase4_recompute_cache(p, instrument, smem);
-    // __syncthreads() is at the end of phase4
+  seqlock_writeback(params, instrument, smem);
+  __syncthreads();
 
-    // Phase 5: Seqlock write-back to pinned buffer (thread 0 only)
-    phase5_seqlock_writeback(p, instrument, smem);
-    __syncthreads();
-
-    // Phase 6: Write delta output buffer (thread 0 only)
-    phase6_write_deltas(p, instrument, smem);
+  write_deltas(params, instrument, smem);
 }
 
-// =============================================================================
-// Host-side kernel launcher (called from GPUDispatch)
-// =============================================================================
+// ── Launch wrapper ────────────────────────────────────────────────────────────
 
-void launch_lob_kernel(
-    const LOBKernelParams& params,
-    cudaStream_t           stream)
-{
-    dim3 grid(GPU_N_INSTRUMENTS);
-    dim3 block(MAX_BATCH_SIZE);
-    size_t smem_bytes = sizeof(BlockSharedMem);
-
-    lob_kernel<<<grid, block, smem_bytes, stream>>>(params);
-
-    // TODO (HW4 Part 10, Task 4): wrap in CUDA Graph for fast stream
-    // to eliminate per-launch CPU overhead (~5-10µs per launch).
+void launch_lob_kernel(const LOBKernelParams &params, cudaStream_t stream) {
+  const dim3 grid(GPU_N_INSTRUMENTS);
+  const dim3 block(MAX_BATCH_SIZE);
+  lob_kernel<<<grid, block, sizeof(BlockSharedMem), stream>>>(params);
 }
-

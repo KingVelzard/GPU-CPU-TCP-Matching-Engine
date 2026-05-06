@@ -1,42 +1,54 @@
 #pragma once
+#include "../tools/utils.h" // PRICE_SCALE, Side constants
 #include <cstdint>
 
-// PRICE_SCALE: fixed-point multiplier
-// Store all prices as int64_t to avoid floating point on GPU 
-// also probably for data integrity 
+// OrderMessage: a 32 byte Message that is sent by the client over the wire
+// Read and then turned into ReactorOrderMessage in Reactor
 
-static constexpr int64_t PRICE_SCALE = 100; // 1.23 -> 123
+struct alignas(32) OrderMessage {
 
-// OrderMessage: the 16-byte fixed-width message
-// TCP Client -> Reactor (one of them lol) -> recv buffer -> MPSC queue
-// -> GPU batch buffer. can be DMA'd into pinned memory with no translation stuff 
-//
-// IMPORTANT:::: DO NOT ADD VARIABLE LENGTH FIELDS
-// GPU kernel casts raw bytes into OrderMessages directly!!!
-
-struct alignas(16) OrderMessage {
-
-  uint8_t side;   // 0 = BID. 1 = ASK 
-  uint8_t type;   // 0 = ADD, 1 = CANCEL, 2 = MARKET (aggressive)
-  uint16_t _pad;  // padding DON'T CHANGE UNLESS UPDATE GPU kernel
-  uint32_t order_id; // unique, monotonically increases per client 
   int64_t price_ticks; // price in fixed-point ticks (price * PRICE_SCALE) / tick_size
-  uint32_t quantity; // quantity in contracts/shares 
+  int64_t quantity;    // quantity in contracts/shares
   uint32_t instrument; // which instrument into GPUBook, CPUOrderBookManager
-
+  uint32_t order_id;   // represents which order for client
+  uint8_t side;        // 0 = BID. 1 = ASK
+  uint8_t type;        // 0 = ADD, 1 = CANCEL, 2 = MARKET (aggressive)
+  uint8_t _pad[6];     // padding DON'T CHANGE UNLESS UPDATE GPU kernel
 };
 
-static_assert(sizeof(OrderMessage) == 24, "ordermessage should be 24 bytes");
+// ReactorOrderMessage: a 64 byte ordermessage struct that contains OrderMessage Data
+// alongside Routing data for returning to client. Written into GPU Batch and for CPU Matcher
+struct alignas(64) ReactorOrderMessage {
+
+  uint8_t side;        // 0 = BID. 1 = ASK
+  uint8_t type;        // 0 = ADD, 1 = CANCEL, 2 = MARKET (aggressive)
+  uint8_t _pad0[2];    // padding DON'T CHANGE UNLESS UPDATE GPU kernel
+  uint32_t order_id;   // represents which order for client
+  int64_t price_ticks; // price in fixed-point ticks (price * PRICE_SCALE) / tick_size
+  int64_t quantity;    // quantity in contracts/shares
+  uint32_t instrument; // which instrument into GPUBook, CPUOrderBookManager
+  uint8_t _pad1[4];    // padding
+
+  // Routing Data
+
+  uint64_t conn_token; // encodes fd + generation for fill conn_token = fd << 32 | generation
+  uint64_t arrive_ns;  // CLOCK_MONOTONIC for testing
+  uint32_t reactor_id; // which reactor owns connection
+  uint8_t _pad2[4];    // padding
+};
+
+static_assert(sizeof(OrderMessage) == 32, "ordermessage should be 32 bytes");
+static_assert(sizeof(ReactorOrderMessage) == 64, "ReactorOrderMessage should be 64 bytes");
 
 // conveinence constants
 
 namespace OrderType {
-  static constexpr uint8_t ADD = 0;
-  static constexpr uint8_t CANCEL = 1;
-  static constexpr uint8_t MARKET = 2; // goes to cpu matcher 
-}
+static constexpr uint8_t ADD = 0;
+static constexpr uint8_t CANCEL = 1;
+static constexpr uint8_t MARKET = 2; // goes to cpu matcher
+} // namespace OrderType
 
 namespace Side {
-  static constexpr uint8_t BID = 0;
-  static constexpr uint8_t ASk = 1;
-}
+static constexpr uint8_t BID = 0;
+static constexpr uint8_t ASk = 1;
+} // namespace Side
